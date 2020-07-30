@@ -8,7 +8,7 @@ import numpy as np
 
 
 
-def _eye_like(M, device=None):
+def _eye_like(M, device=None, dtype=None):
     """
     Creates an identity matrix of the same shape as M, if M is a (n,n)-matrix.
     If M is a batch of m matrices (i.e. a (m,n,n)-tensor), create a batch of
@@ -19,18 +19,20 @@ def _eye_like(M, device=None):
     n = M.shape[-1]
     if device is None:
         device = M.device
-    eye = torch.eye(M.shape[-1], device=device) 
+    if dtype is None:
+        dtype = M.dtype
+    eye = torch.eye(M.shape[-1], device=device, dtype=dtype) 
     if len(M.shape)==2:
         return eye
     else:
         m = M.shape[0]
         return eye.view(-1,n,n).expand(m, -1, -1)
     
-def _eye(n, m=0, device=None):
+def _eye(n, m=0, device=None, dtype=None):
     """
     Creates a (n,n)-identity-matrix or, if m>0, a batch of identity matrices.
     """
-    eye = torch.eye(n, device=device)
+    eye = torch.eye(n, device=device, dtype=dtype)
     if m==0:
         return eye
     else:
@@ -52,66 +54,42 @@ def _compute_scales(A):
                     7: 0.783460847296204,
                     9: 1.782448623969279,
                    13: 4.740307543765127}
-            if max_norm >= ell[9]:
-                m = 13
-                magic_number = ell[m]
-                s = torch.relu_(torch.ceil(torch.log2_(norm / magic_number)))
-            else:
-                for m in [3,5,7,9]:
-                    if max_norm < ell[m]:
-                        magic_number = ell[m]
-                        # results in s = 0
-                        break
- 
         else:
-            # This is the magic number for exp(A) only, not for dexp(A)E
             ell = { 3: 0.014955852179582,
                     5: 0.253939833006323,
                     7: 0.950417899616293,
                     9: 2.097847961257068,
                    13: 5.371920351148152}
-            if max_norm >= ell[9]:
-                m = 13
-                magic_number = ell[m]
-                s = torch.relu_(torch.ceil(torch.log2_(norm / magic_number)))
-            else:
-                for m in [3,5,7,9]:
-                    if max_norm < ell[m]:
-                        magic_number = ell[m]
-                        # results in s = 0
-                        break
+        if max_norm >= ell[9]:
+            m = 13
+            magic_number = ell[m]
+            s = torch.relu_(torch.ceil(torch.log2_(norm / magic_number)))
+        else:
+            for m in [3,5,7,9]:
+                if max_norm < ell[m]:
+                    magic_number = ell[m]
+                    # results in s = torch.tensor([0,...,0])
+                    break
         
-    elif A.dtype == torch.float32:
-        # This is the magic number for exp(A) only, not for dexp(A)E
+    elif A.dtype == torch.float32: 
         if A.requires_grad:
             ell = {3: 0.308033041845330,
                    5: 1.482532614793145,
-                   7: 3.248671755200478}
-            if max_norm >= ell[5]:
-                m = 7
-                magic_number = ell[m]
-                s = torch.relu_(torch.ceil(torch.log2_(norm / magic_number)))
-            else:
-                for m in [3,5]:
-                    if max_norm < ell[m]:
-                        # results in s = 0
-                        magic_number = ell[m]
-                        break
-                        
+                   7: 3.248671755200478}                        
         else:
             ell = {3: 0.425873001692283,
                    5: 1.880152677804762,
                    7: 3.925724783138660}
-            if max_norm >= ell[5]:
-                m = 7
-                magic_number = ell[m]
-                s = torch.relu_(torch.ceil(torch.log2_(norm / magic_number)))
-            else:
-                for m in [3,5]:
-                    if max_norm < ell[m]:
-                        # results in s = 0
-                        magic_number = ell[m]
-                        break
+        if max_norm >= ell[5]:
+            m = 7
+            magic_number = ell[m]
+            s = torch.relu_(torch.ceil(torch.log2_(norm / magic_number)))
+        else:
+            for m in [3,5]:
+                if max_norm < ell[m]:
+                    # results in s = torch.tensor([0,...,0])
+                    magic_number = ell[m]
+                    break
     return s, m
 
 def _square(s, R, L=None):
@@ -189,10 +167,8 @@ def _expm_frechet_scaling_squaring(A, E, adjoint=False):
     assert(A.shape[-1]==A.shape[-2] and len(A.shape) in [2,3])
     has_batch_dim = True if len(A.shape)==3 else False
     
-
     if adjoint == True:
-        A = torch.transpose(A,-1,-2)
-    
+        A = torch.transpose(A,-1,-2)   
         
     # Step 1: Scale matrices in A and E according to a norm criterion
     s, m = _compute_scales(A)
@@ -234,9 +210,9 @@ def _expm_pade(A, m=7):
     
     # pre-computing terms
     I = _eye_like(A)
-    U = b[1]*I
-    V = b[0]*I
     if m!=13: # There is a more efficient algorithm for m=13
+        U = b[1]*I
+        V = b[0]*I
         if m >= 3:
             A_2 = A @ A
             U = U + b[3]*A_2
@@ -253,9 +229,21 @@ def _expm_pade(A, m=7):
             A_8 = A_4 @ A_4
             U = U + b[9]*A_8
             V = V + b[8]*A_8
+        U = A @ U
     else:
-        raise NotImplementedError("m=13 not implemented")
-    U = A @ U
+        A_2 = A @ A 
+        A_4 = A_2 @ A_2
+        A_6 = A_4 @ A_2
+        
+        W_1 = b[13]*A_6 + b[11]*A_4 + b[9]*A_2
+        W_2 = b[7]*A_6 + b[5]*A_4 + b[3]*A_2 + b[1]*I
+        W = A_6 @ W_1 + W_2
+        
+        Z_1 = b[12]*A_6 + b[10]*A_4 + b[8]*A_2
+        Z_2 = b[6]*A_6 + b[4]*A_4 + b[2]*A_2 + b[0]*I
+        
+        U = A @ W
+        V = A_6 @ Z_1 + Z_2
     
     del A_2
     if m>=5: del A_4
@@ -287,47 +275,78 @@ def _expm_frechet_pade(A, E, m=7, adjoint=False):
 
     # Efficiently compute series terms of M_i (and A_i if needed).
     # Not very pretty, but more readable than the alternatives.
+    I = _eye_like(A)
     if m!=13:
         if m >= 3:
             M_2 = A @ E + E @ A
             A_2 = A @ A 
-            V = b[2]*A_2
             U = b[3]*A_2
+            V = b[2]*A_2
             L_U = b[3]*M_2
             L_V = b[2]*M_2
         if m >= 5:
             M_4 = A_2 @ M_2 + M_2 @ A_2
             A_4 = A_2 @ A_2
-            V = V + b[4]*A_4
             U = U + b[5]*A_4
+            V = V + b[4]*A_4
             L_U = L_U + b[5]*M_4
             L_V = L_V + b[4]*M_4
         if m >= 7:
             M_6 = A_4 @ M_2 + M_4 @ A_2
             A_6 = A_4 @ A_2
-            V = V + b[6]*A_6
             U = U + b[7]*A_6
+            V = V + b[6]*A_6
             L_U = L_U + b[7]*M_6
             L_V = L_V + b[6]*M_6
         if m == 9:
             M_8 = A_4 @ M_4 + M_4 @ A_4
             A_8 = A_4 @ A_4
-            V = V + b[8]*A_8
             U = U + b[9]*A_8
-            L_U = L_U + b[8]*M_8
-            L_V = L_V + b[6]*M_6
-    else:
-        raise NotImplementedError("m = 13 not implemented")
+            V = V + b[8]*A_8
+            L_U = L_U + b[9]*M_8
+            L_V = L_V + b[8]*M_8
+            
+        U = U + b[1]*I
+        V = U + b[0]*I
+        del I
 
-    I = _eye_like(A)
-    U = U + b[1]*I
-    V = U + b[0]*I
-    del I
+        L_U = A @ L_U
+        L_U = L_U + E @ U
+
+        U = A @ U
+            
+    else:
+        M_2 = A @ E + E @ A
+        A_2 = A @ A 
         
-    L_U = A @ L_U
-    L_U = L_U + E @ U
-    
-    U = A @ U
+        M_4 = A_2 @ M_2 + M_2 @ A_2
+        A_4 = A_2 @ A_2
+        
+        M_6 = A_4 @ M_2 + M_4 @ A_2
+        A_6 = A_4 @ A_2
+        
+        W_1 = b[13]*A_6 + b[11]*A_4 + b[9]*A_2 
+        W_2 = b[7]*A_6 + b[5]*A_4 + b[3]*A_2 + b[1]*I
+        
+        W = A_6 @ W_1 + W_2
+
+        Z_1 = b[12]*A_6 + b[10]*A_4 + b[8]*A_2
+        Z_2 = b[6]*A_6 + b[4]*A_4 + b[2]*A_2 + b[0]*I
+        
+        U = A @ W
+        V = A_6 @ Z_1 + Z_2
+        
+        L_W1 = b[13]*M_6 + b[11]*M_4 + b[9]*M_2
+        L_W2 = b[7]*M_6 + b[5]*M_4 + b[3]*M_2
+        
+        L_Z1 = b[12]*M_6 + b[10]*M_4 + b[8]*M_2
+        L_Z2 = b[6]*M_6 + b[4]*M_4 + b[2]*M_2
+        
+        L_W = A_6 @ L_W1 + M_6 @ W_1 + L_W2
+        L_U = A @ L_W + E @ W   
+        L_V = A_6 @ L_Z1 + M_6 @ Z_1 + L_Z2
+
+
     
     lu_decom = torch.lu(-U + V)
     exp_A = torch.lu_solve(U + V, *lu_decom)
@@ -349,9 +368,6 @@ class expm(Function):
         dexpm = _expm_frechet_scaling_squaring(
             M, grad_out, adjoint=True)
         return dexpm    
-    
-    
-    
     
     
     
